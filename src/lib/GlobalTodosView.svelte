@@ -8,6 +8,8 @@
     title: string;
     details: string;
     completed: boolean;
+    action_kind?: string;
+    action_target?: string;
   };
 
   type GlobalTab = {
@@ -29,6 +31,8 @@
   let todoModal = $state<{ id: string | null } | null>(null);
   let modalTitle = $state("");
   let modalDetails = $state("");
+  let modalActionKind = $state<"" | "url" | "folder">("");
+  let modalActionTarget = $state("");
 
   let dragSourceIdx = $state<number | null>(null);
   let dragOverIdx = $state<number | null>(null);
@@ -125,24 +129,62 @@
     todoModal = { id: null };
     modalTitle = "";
     modalDetails = "";
+    modalActionKind = "";
+    modalActionTarget = "";
   }
 
   function openModalEdit(t: Todo) {
     todoModal = { id: t.id };
     modalTitle = t.title;
     modalDetails = t.details;
+    modalActionKind = (t.action_kind as "" | "url" | "folder") ?? "";
+    modalActionTarget = t.action_target ?? "";
   }
 
   function closeModal() {
     todoModal = null;
     modalTitle = "";
     modalDetails = "";
+    modalActionKind = "";
+    modalActionTarget = "";
+  }
+
+  function autoDetectAction(s: string): "" | "url" | "folder" {
+    const v = s.trim();
+    if (!v) return "";
+    if (/^https?:\/\//i.test(v)) return "url";
+    if (/^[a-zA-Z]:[\\/]/.test(v)) return "folder";
+    if (v.startsWith("\\\\")) return "folder";
+    if (v.startsWith("/")) return "folder";
+    if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(v)) return "url";
+    return "";
+  }
+
+  $effect(() => {
+    if (modalActionKind === "" && modalActionTarget) {
+      const guess = autoDetectAction(modalActionTarget);
+      if (guess) modalActionKind = guess;
+    }
+  });
+
+  async function runAction(t: Todo) {
+    if (!t.action_kind || !t.action_target) return;
+    try {
+      await invoke("open_todo_action", {
+        kind: t.action_kind,
+        target: t.action_target,
+      });
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   async function saveModal() {
     if (!todoModal || !activeTabId) return;
     const title = modalTitle.trim();
     if (!title) return;
+    const action_kind = modalActionTarget.trim() ? modalActionKind : "";
+    const action_target = modalActionTarget.trim();
     try {
       if (todoModal.id) {
         await invoke("update_global_todo", {
@@ -150,12 +192,16 @@
           id: todoModal.id,
           title,
           details: modalDetails,
+          actionKind: action_kind,
+          actionTarget: action_target,
         });
       } else {
         await invoke("add_global_todo", {
           tabId: activeTabId,
           title,
           details: modalDetails,
+          actionKind: action_kind,
+          actionTarget: action_target,
         });
       }
       closeModal();
@@ -271,6 +317,24 @@
       </div>
       <input class="todo-modal-title" bind:value={modalTitle} placeholder="Title" />
       <textarea class="todo-modal-details" bind:value={modalDetails} placeholder="Details (optional)"></textarea>
+      <div class="todo-action-row">
+        <label class="todo-action-label">Quick action (optional)</label>
+        <div class="todo-action-input-row">
+          <select class="todo-action-kind" bind:value={modalActionKind}>
+            <option value="">— none —</option>
+            <option value="url">🔗 Open URL</option>
+            <option value="folder">📁 Open path</option>
+          </select>
+          <input
+            class="todo-action-target"
+            bind:value={modalActionTarget}
+            placeholder={modalActionKind === "url" ? "https://… or just google.com" : modalActionKind === "folder" ? "C:\\path\\to\\folder or file" : "Paste a URL or a path — type auto-detected"}
+          />
+        </div>
+        {#if modalActionTarget.trim() && modalActionKind}
+          <div class="todo-action-hint">Clicking the 🔗/📁 icon on this todo will {modalActionKind === "url" ? "open the URL in your default browser" : "open the path in Explorer"}.</div>
+        {/if}
+      </div>
       <div class="todo-modal-actions">
         <button class="primary small" onclick={saveModal} disabled={!modalTitle.trim()}>
           {todoModal.id ? "Save" : "Add"}
@@ -394,6 +458,14 @@
           <div class="todo-body">
             <div class="todo-title">{todo.title}</div>
           </div>
+          {#if todo.action_kind && todo.action_target}
+            <button
+              class="icon-tiny todo-launcher"
+              onclick={() => runAction(todo)}
+              title={`${todo.action_kind === "url" ? "Open URL" : "Open path"}: ${todo.action_target}`}
+              aria-label="Run quick action"
+            >{todo.action_kind === "url" ? "🔗" : "📁"}</button>
+          {/if}
           <button class="icon-tiny" onclick={() => openModalEdit(todo)} title="Edit" aria-label="Edit">
             <Icon name="pencil" size={11} />
           </button>
@@ -818,4 +890,19 @@
     justify-content: flex-end;
     gap: 8px;
   }
+
+  .todo-action-row { display: flex; flex-direction: column; gap: 4px; }
+  .todo-action-label {
+    font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+  }
+  .todo-action-input-row { display: grid; grid-template-columns: auto 1fr; gap: 6px; }
+  .todo-action-kind, .todo-action-target {
+    background: var(--card); border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 8px; font: inherit; font-size: 12px; color: var(--text);
+  }
+  .todo-action-target { min-width: 0; }
+  .todo-action-hint { font-size: 10px; color: var(--text-dim); font-style: italic; }
+  .todo-launcher { font-size: 13px; padding: 2px 4px; }
+  .todo-launcher:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 </style>

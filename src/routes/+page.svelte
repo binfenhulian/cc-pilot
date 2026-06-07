@@ -46,6 +46,8 @@
     title: string;
     details: string;
     completed: boolean;
+    action_kind?: string;    // "" | "url" | "folder"
+    action_target?: string;
   };
 
   type ScriptItem = {
@@ -146,6 +148,35 @@
   let geoChecking = $state(false);
   let proxyHost = $state("127.0.0.1");
   let proxyPort = $state(10809);
+
+  // Diagnostic toggle: pause all background probes (latency, geo, usage,
+  // node version). Project list polling (load()) is kept on so the UI keeps
+  // working. Persisted across launches so an A/B test survives a restart.
+  let probesPaused = $state(false);
+  try {
+    probesPaused = localStorage.getItem("probesPaused") === "1";
+  } catch {}
+  function toggleProbes() {
+    probesPaused = !probesPaused;
+    try { localStorage.setItem("probesPaused", probesPaused ? "1" : "0"); } catch {}
+    if (!probesPaused) {
+      // Resuming — kick a fresh refresh of each immediately.
+      refreshLatency();
+      refreshGeo();
+      refreshUsage();
+      invoke<string | null>("node_version_refresh").then((v) => (nodeVer = v)).catch(() => {});
+    }
+  }
+
+  const latTier = $derived(
+    !proxyLat ? "idle"
+    : !proxyLat.alive ? "down"
+    : proxyLat.error ? "error"
+    : proxyLat.latency_ms == null ? "idle"
+    : proxyLat.latency_ms < 300 ? "fast"
+    : proxyLat.latency_ms < 1000 ? "slow"
+    : "very-slow"
+  );
 
   async function refreshLatency() {
     if (latChecking) return;
@@ -256,7 +287,13 @@
     nvmMenuOpen = true;
     nvmInfo = null;
     try {
-      nvmInfo = await invoke<NvmInfo>("nvm_list");
+      // Refresh both in parallel so the menu and the badge agree.
+      const [list, ver] = await Promise.all([
+        invoke<NvmInfo>("nvm_list"),
+        invoke<string | null>("node_version_refresh"),
+      ]);
+      nvmInfo = list;
+      nodeVer = ver;
     } catch (e) {
       nvmInfo = { available: false, current: null, versions: [], error: String(e) };
     }
@@ -288,6 +325,8 @@
   let todoModal = $state<{ projectPath: string; id: string | null } | null>(null);
   let modalTodoTitle = $state("");
   let modalTodoDetails = $state("");
+  let modalTodoActionKind = $state<"" | "url" | "folder">("");
+  let modalTodoActionTarget = $state("");
 
   let preview = $state<{ src: string; name: string; openExternal: (() => void) | null } | null>(
     null
@@ -339,7 +378,7 @@
   let editingValue = $state("");
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
-  const POLL_MS = 3000;
+  const POLL_MS = 5000;
 
   let filteredProjects = $derived.by(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -438,12 +477,37 @@
     }
   }
 
+  // Fingerprint of the project list: skip reactive update when nothing
+  // we visually depend on has changed. Cuts ~90% of useless svelte rerenders
+  // on the steady-state 5s poll, which was the dominant cause of input
+  // stutter while typing in todos / dragging windows.
+  let lastProjectsFingerprint = "";
+
+  function fingerprintProjects(list: ProjectGroup[]): string {
+    const parts: string[] = [];
+    for (const p of list) {
+      parts.push(
+        `${p.project_path}|${p.is_starred ? 1 : 0}|${p.is_archived ? 1 : 0}|${p.alias}|${p.running_count}|${p.todo_pending_count}`
+      );
+      for (const s of p.sessions) {
+        parts.push(`${s.id}|${s.last_activity_ms}|${s.message_count}|${s.is_running ? 1 : 0}|${s.alias}`);
+      }
+    }
+    return parts.join("\n");
+  }
+
   async function load(showSpinner = true) {
     if (showSpinner) loading = true;
     try {
-      projects = await invoke<ProjectGroup[]>("list_projects");
+      const fresh = await invoke<ProjectGroup[]>("list_projects");
+      const fp = fingerprintProjects(fresh);
+      const projectsChanged = fp !== lastProjectsFingerprint;
+      if (projectsChanged) {
+        projects = fresh;
+        lastProjectsFingerprint = fp;
+      }
       const currentIds = new Set<string>();
-      for (const p of projects) for (const s of p.sessions) if (s.is_running) currentIds.add(s.id);
+      for (const p of fresh) for (const s of p.sessions) if (s.is_running) currentIds.add(s.id);
       await notifySessionExits(currentIds);
       prevRunningSessionIds = currentIds;
       refreshGlobalTodoBadge();
@@ -960,18 +1024,56 @@
     todoModal = { projectPath: p.project_path, id: null };
     modalTodoTitle = "";
     modalTodoDetails = "";
+    modalTodoActionKind = "";
+    modalTodoActionTarget = "";
   }
 
   function openTodoModalEdit(p: ProjectGroup, t: Todo) {
     todoModal = { projectPath: p.project_path, id: t.id };
     modalTodoTitle = t.title;
     modalTodoDetails = t.details;
+    modalTodoActionKind = (t.action_kind as "" | "url" | "folder") ?? "";
+    modalTodoActionTarget = t.action_target ?? "";
   }
 
   function closeTodoModal() {
     todoModal = null;
     modalTodoTitle = "";
     modalTodoDetails = "";
+    modalTodoActionKind = "";
+    modalTodoActionTarget = "";
+  }
+
+  // Auto-detect action kind from the target string so the user usually
+  // doesn't have to touch the dropdown.
+  function autoDetectAction(s: string): "" | "url" | "folder" {
+    const v = s.trim();
+    if (!v) return "";
+    if (/^https?:\/\//i.test(v)) return "url";
+    if (/^[a-zA-Z]:[\\/]/.test(v)) return "folder";    // C:\... or D:/...
+    if (v.startsWith("\\\\")) return "folder";          // UNC \\server\share
+    if (v.startsWith("/")) return "folder";             // POSIX-ish absolute
+    if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(v)) return "url"; // bare hostname like google.com or github.com/x
+    return "";
+  }
+
+  $effect(() => {
+    if (modalTodoActionKind === "" && modalTodoActionTarget) {
+      const guess = autoDetectAction(modalTodoActionTarget);
+      if (guess) modalTodoActionKind = guess;
+    }
+  });
+
+  async function runTodoAction(t: Todo) {
+    if (!t.action_kind || !t.action_target) return;
+    try {
+      await invoke("open_todo_action", {
+        kind: t.action_kind,
+        target: t.action_target,
+      });
+    } catch (e) {
+      error = `Open failed: ${e}`;
+    }
   }
 
   async function saveTodoModal() {
@@ -979,6 +1081,8 @@
     const title = modalTodoTitle.trim();
     if (!title) return;
     const target = todoModal;
+    const action_kind = modalTodoActionTarget.trim() ? modalTodoActionKind : "";
+    const action_target = modalTodoActionTarget.trim();
     try {
       if (target.id) {
         await invoke("update_todo", {
@@ -986,12 +1090,16 @@
           id: target.id,
           title,
           details: modalTodoDetails,
+          actionKind: action_kind,
+          actionTarget: action_target,
         });
       } else {
         await invoke("add_todo", {
           projectPath: target.projectPath,
           title,
           details: modalTodoDetails,
+          actionKind: action_kind,
+          actionTarget: action_target,
         });
       }
       const p = projects.find((x) => x.project_path === target.projectPath);
@@ -1540,29 +1648,39 @@
     document.addEventListener("mousedown", handleDocClick);
     document.addEventListener("keydown", handleEsc);
 
-    // System info: node version (one-shot, cached in backend), proxy status (every 30s).
+    // System info: node version is cached but auto-refreshed every 60s so
+    // external `nvm use` from a terminal eventually shows up in the status bar.
     invoke<string | null>("node_version").then((v) => (nodeVer = v)).catch(() => {});
+    nodeVersionIntervalId = setInterval(async () => {
+      if (document.hidden || probesPaused) return;
+      try {
+        nodeVer = await invoke<string | null>("node_version_refresh");
+      } catch {}
+    }, 60_000);
     const tickUptime = setInterval(async () => {
       try {
         uptimeMs = await invoke<number>("app_uptime_ms");
       } catch {}
-    }, 1000);
+    }, 5000);
     uptimeIntervalId = tickUptime;
     const tickLat = () => {
-      if (document.hidden) return;
+      if (document.hidden || probesPaused) return;
       refreshLatency();
     };
     const tickGeo = () => {
-      if (document.hidden) return;
+      if (document.hidden || probesPaused) return;
       refreshGeo();
     };
-    refreshLatency();
-    refreshGeo();
-    refreshUsage();
+    if (!probesPaused) {
+      refreshLatency();
+      refreshGeo();
+      refreshUsage();
+    }
     latIntervalId = setInterval(tickLat, 30_000);          // 30s
     geoIntervalId = setInterval(tickGeo, 30 * 60_000);     // 30min
     usageIntervalId = setInterval(() => {
-      if (!document.hidden) refreshUsage();
+      if (document.hidden || probesPaused) return;
+      refreshUsage();
     }, 30_000);                                            // 30s
   });
 
@@ -1570,6 +1688,7 @@
   let latIntervalId: ReturnType<typeof setInterval> | null = null;
   let geoIntervalId: ReturnType<typeof setInterval> | null = null;
   let usageIntervalId: ReturnType<typeof setInterval> | null = null;
+  let nodeVersionIntervalId: ReturnType<typeof setInterval> | null = null;
 
   function fmtUptime(ms: number): string {
     const sec = Math.floor(ms / 1000);
@@ -1587,6 +1706,7 @@
     if (latIntervalId) clearInterval(latIntervalId);
     if (geoIntervalId) clearInterval(geoIntervalId);
     if (usageIntervalId) clearInterval(usageIntervalId);
+    if (nodeVersionIntervalId) clearInterval(nodeVersionIntervalId);
     document.removeEventListener("visibilitychange", handleVisibility);
     document.removeEventListener("mousedown", handleDocClick);
     document.removeEventListener("keydown", handleEsc);
@@ -1635,6 +1755,24 @@
         bind:value={modalTodoDetails}
         placeholder="Details (optional)"
       ></textarea>
+      <div class="todo-action-row">
+        <label class="todo-action-label">Quick action (optional)</label>
+        <div class="todo-action-input-row">
+          <select class="todo-action-kind" bind:value={modalTodoActionKind}>
+            <option value="">— none —</option>
+            <option value="url">🔗 Open URL</option>
+            <option value="folder">📁 Open path</option>
+          </select>
+          <input
+            class="todo-action-target"
+            bind:value={modalTodoActionTarget}
+            placeholder={modalTodoActionKind === "url" ? "https://… or just google.com" : modalTodoActionKind === "folder" ? "C:\\path\\to\\folder or file" : "Paste a URL or a path — type auto-detected"}
+          />
+        </div>
+        {#if modalTodoActionTarget.trim() && modalTodoActionKind}
+          <div class="todo-action-hint">Clicking the 🔗/📁 icon on this todo will {modalTodoActionKind === "url" ? "open the URL in your default browser" : "open the path in Explorer"}.</div>
+        {/if}
+      </div>
       <div class="todo-modal-actions">
         <button class="primary small" onclick={saveTodoModal} disabled={!modalTodoTitle.trim()}>{todoModal.id ? "Save" : "Add"}</button>
         <button class="small" onclick={closeTodoModal}>Cancel (Esc)</button>
@@ -2208,6 +2346,14 @@
                       <div class="todo-body">
                         <div class="todo-title">{todo.title}</div>
                       </div>
+                      {#if todo.action_kind && todo.action_target}
+                        <button
+                          class="icon-tiny todo-launcher"
+                          onclick={() => runTodoAction(todo)}
+                          title={`${todo.action_kind === "url" ? "Open URL" : "Open path"}: ${todo.action_target}`}
+                          aria-label="Run quick action"
+                        >{todo.action_kind === "url" ? "🔗" : "📁"}</button>
+                      {/if}
                       <button class="icon-tiny" onclick={() => openTodoModalEdit(p, todo)} title="Edit" aria-label="Edit"><Icon name="pencil" size={11} /></button>
                       <button class="icon-tiny danger" onclick={() => deleteTodo(p, todo)} title="Delete" aria-label="Delete"><Icon name="trash" size={11} /></button>
                     </li>
@@ -2344,6 +2490,16 @@
         </div>
       {/if}
     </div>
+    <button
+      class="status-item probes-toggle"
+      class:probes-off={probesPaused}
+      onclick={toggleProbes}
+      title={probesPaused
+        ? "All background probes paused (latency / IP / usage / node). Click to resume."
+        : "Pause all background probes — diagnostic toggle. Click to disable probes for A/B testing UI lag."}
+    >
+      {probesPaused ? "⏸ probes paused" : "⏵ probes on"}
+    </button>
     <span class="status-spacer"></span>
     <div class="status-item usage-anchor">
       {#if !usageMon || !usageMon.enabled}
@@ -2380,9 +2536,7 @@
       {/if}
     </div>
     <button
-      class="status-item proxy-pill"
-      class:proxy-down={proxyLat && !proxyLat.alive}
-      class:proxy-warn={proxyLat && proxyLat.alive && proxyLat.error}
+      class="status-item proxy-pill lat-{latTier}"
       class:proxy-checking={latChecking}
       onclick={refreshLatency}
       title={proxyLat?.error ?? "Latency · click to refresh (auto every 30s)"}
@@ -2390,11 +2544,17 @@
       {#if !proxyLat}
         ⚡ …
       {:else if !proxyLat.alive}
-        ⚠ down
+        ⛔ down
       {:else if proxyLat.error}
         ⚠ {proxyLat.latency_ms != null ? `${proxyLat.latency_ms}ms` : "?"}
+      {:else if latTier === "fast"}
+        ⚡ {proxyLat.latency_ms}ms
+      {:else if latTier === "slow"}
+        🐢 {proxyLat.latency_ms}ms
+      {:else if latTier === "very-slow"}
+        🔥 {proxyLat.latency_ms}ms
       {:else}
-        ⚡ {proxyLat.latency_ms != null ? `${proxyLat.latency_ms}ms` : "?"}
+        ⚡ {proxyLat.latency_ms ?? "?"}ms
       {/if}
     </button>
     <button
@@ -3996,6 +4156,62 @@
     gap: 8px;
   }
 
+  .todo-action-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .todo-action-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+
+  .todo-action-input-row {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px;
+  }
+
+  .todo-action-kind {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text);
+  }
+
+  .todo-action-target {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text);
+    min-width: 0;
+  }
+
+  .todo-action-hint {
+    font-size: 10px;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+
+  .todo-launcher {
+    font-size: 13px;
+    padding: 2px 4px;
+  }
+
+  .todo-launcher:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
   /* ── Session preview modal ──────────────────────────────────────── */
 
   .session-preview-modal {
@@ -4152,19 +4368,85 @@
     background: color-mix(in srgb, var(--accent) 14%, transparent);
   }
 
-  .proxy-pill.proxy-down {
-    background: color-mix(in srgb, #d33 14%, transparent);
-    border-color: color-mix(in srgb, #d33 40%, var(--border));
-    color: #d33;
+  .proxy-pill.proxy-down,
+  .proxy-pill.lat-down {
+    background: #d63030;
+    border-color: #b21f1f;
+    color: #fff;
+    font-weight: 700;
+    animation: latPulse 1.6s ease-in-out infinite;
   }
 
-  .proxy-pill.proxy-warn {
-    background: color-mix(in srgb, var(--star) 16%, transparent);
-    border-color: color-mix(in srgb, var(--star) 40%, var(--border));
+  .proxy-pill.proxy-warn,
+  .proxy-pill.lat-error {
+    background: #f4a300;
+    border-color: #cf8a00;
+    color: #fff;
+    font-weight: 600;
+  }
+
+  .proxy-pill.lat-fast {
+    background: #1e8a3c;
+    border-color: #166a2e;
+    color: #fff;
+    font-weight: 600;
+  }
+
+  .proxy-pill.lat-slow {
+    background: #e6a800;
+    border-color: #b88500;
+    color: #2a1d00;
+    font-weight: 600;
+  }
+
+  .proxy-pill.lat-very-slow {
+    background: #e25822;
+    border-color: #b8431b;
+    color: #fff;
+    font-weight: 700;
+    animation: latPulse 2.2s ease-in-out infinite;
+  }
+
+  .proxy-pill.lat-idle {
+    /* keep default look */
+  }
+
+  .proxy-pill.lat-fast:hover { background: #228c41; }
+  .proxy-pill.lat-slow:hover { background: #ffb800; }
+  .proxy-pill.lat-very-slow:hover { background: #e8612d; }
+  .proxy-pill.lat-down:hover { background: #df3838; }
+
+  @keyframes latPulse {
+    0%, 100% { box-shadow: 0 0 0 0 currentColor; }
+    50%      { box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 28%, transparent); }
   }
 
   .proxy-pill.proxy-checking {
     opacity: 0.65;
+  }
+
+  .probes-toggle {
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--text-dim);
+    padding: 2px 8px;
+    border-radius: 10px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+
+  .probes-toggle:hover {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--text);
+  }
+
+  .probes-toggle.probes-off {
+    background: color-mix(in srgb, var(--star) 22%, transparent);
+    border: 1px solid var(--star);
+    color: var(--text);
+    font-weight: 600;
   }
 
   .nvm-anchor {

@@ -65,6 +65,10 @@ struct Todo {
     title: String,
     details: String,
     completed: bool,
+    #[serde(default)]
+    action_kind: String, // "" | "url" | "folder"
+    #[serde(default)]
+    action_target: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -131,6 +135,9 @@ struct AppState {
     running_scripts: Mutex<HashMap<String, ScriptRun>>,
     aliases: Mutex<AliasStore>,
     archived: Mutex<HashSet<String>>,
+    // Reused across list_projects calls so we don't re-allocate the process
+    // map every 5 seconds. sysinfo internally keeps its HashMap warm.
+    sys: Mutex<System>,
 }
 
 fn ccpilot_data_dir() -> Option<PathBuf> {
@@ -444,10 +451,10 @@ fn parse_session_meta(path: &Path) -> ParsedMeta {
     meta
 }
 
-fn alive_session_ids() -> HashSet<String> {
-    let mut sys = System::new();
-
+fn alive_session_ids(sys: &mut System) -> HashSet<String> {
     // Pass 1: refresh process names only (cheap; no cmdline read).
+    // Reusing the cached System keeps its internal HashMap allocation warm
+    // across calls, so successive refreshes only update entries that changed.
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -507,7 +514,10 @@ fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectGroup>, String
         return Ok(vec![]);
     }
 
-    let alive = alive_session_ids();
+    let alive = {
+        let mut sys = state.sys.lock().unwrap();
+        alive_session_ids(&mut sys)
+    };
     let stars = state.starred.lock().unwrap().clone();
     let archived = state.archived.lock().unwrap().clone();
     let (project_aliases, session_aliases) = {
@@ -821,11 +831,26 @@ fn run_script(
             // Read .ps1 file via [IO.File]::ReadAllText to force UTF-8 decoding
             // (PowerShell 5.1's `-File` defaults to ANSI/GBK on Chinese Windows
             // and mangles non-ASCII paths/strings inside the script).
+            //
+            // We also seed $PSScriptRoot / $PSCommandPath ourselves: scripts
+            // created via [scriptblock]::Create() are not file-backed, so PS
+            // never auto-sets these. Without this, idiomatic patterns like
+            // `Join-Path $PSScriptRoot '..'` blow up with "empty string".
             let abs_path = script_path.to_string_lossy().to_string();
-            let escaped = abs_path.replace('\'', "''");
+            let script_dir = script_path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| project_path.clone());
+            let escaped_path = abs_path.replace('\'', "''");
+            let escaped_dir = script_dir.replace('\'', "''");
+            // NOTE: wt.exe treats `;` as a "new tab/pane" separator even when
+            // the arg is double-quoted. We escape every `;` as `\;` per
+            // <https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments>.
+            // wt.exe consumes the backslash and forwards a literal `;` to
+            // powershell.exe so it works as a normal PS statement separator.
             let ps_cmd = format!(
-                "& ([scriptblock]::Create([System.IO.File]::ReadAllText('{}')))",
-                escaped
+                "$PSScriptRoot='{}'\\; $PSCommandPath='{}'\\; & ([scriptblock]::Create([System.IO.File]::ReadAllText('{}')))",
+                escaped_dir, escaped_path, escaped_path
             );
             cmd.args([
                 "powershell",
@@ -1025,18 +1050,26 @@ fn list_todos(project_path: String) -> Result<Vec<Todo>, String> {
 }
 
 #[tauri::command]
-fn add_todo(project_path: String, title: String, details: String) -> Result<Todo, String> {
+fn add_todo(
+    project_path: String,
+    title: String,
+    details: String,
+    action_kind: Option<String>,
+    action_target: Option<String>,
+) -> Result<Todo, String> {
     let title = title.trim().to_string();
     if title.is_empty() {
         return Err("title cannot be empty".into());
     }
-    let mut todos = load_todos(&project_path);
     let todo = Todo {
         id: short_random_id(),
         title,
         details,
         completed: false,
+        action_kind: action_kind.unwrap_or_default(),
+        action_target: action_target.unwrap_or_default(),
     };
+    let mut todos = load_todos(&project_path);
     todos.push(todo.clone());
     save_todos(&project_path, &todos)?;
     Ok(todo)
@@ -1048,6 +1081,8 @@ fn update_todo(
     id: String,
     title: String,
     details: String,
+    action_kind: Option<String>,
+    action_target: Option<String>,
 ) -> Result<(), String> {
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -1059,6 +1094,8 @@ fn update_todo(
         if t.id == id {
             t.title = title.clone();
             t.details = details.clone();
+            t.action_kind = action_kind.clone().unwrap_or_default();
+            t.action_target = action_target.clone().unwrap_or_default();
             found = true;
             break;
         }
@@ -1207,7 +1244,13 @@ fn delete_global_tab(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn add_global_todo(tab_id: String, title: String, details: String) -> Result<Todo, String> {
+fn add_global_todo(
+    tab_id: String,
+    title: String,
+    details: String,
+    action_kind: Option<String>,
+    action_target: Option<String>,
+) -> Result<Todo, String> {
     let title = title.trim().to_string();
     if title.is_empty() {
         return Err("title cannot be empty".into());
@@ -1220,6 +1263,8 @@ fn add_global_todo(tab_id: String, title: String, details: String) -> Result<Tod
                 title,
                 details,
                 completed: false,
+                action_kind: action_kind.unwrap_or_default(),
+                action_target: action_target.unwrap_or_default(),
             };
             t.todos.push(todo.clone());
             save_global_tabs(&tabs)?;
@@ -1235,6 +1280,8 @@ fn update_global_todo(
     id: String,
     title: String,
     details: String,
+    action_kind: Option<String>,
+    action_target: Option<String>,
 ) -> Result<(), String> {
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -1247,6 +1294,8 @@ fn update_global_todo(
                 if todo.id == id {
                     todo.title = title;
                     todo.details = details;
+                    todo.action_kind = action_kind.clone().unwrap_or_default();
+                    todo.action_target = action_target.clone().unwrap_or_default();
                     return save_global_tabs(&tabs);
                 }
             }
@@ -2283,6 +2332,47 @@ fn open_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn open_todo_action(kind: String, target: String) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("empty target".into());
+    }
+    match kind.as_str() {
+        "url" => {
+            // Normalize: prepend https:// if no scheme present so users can type
+            // bare hostnames like "google.com" or "github.com/foo/bar".
+            let url = if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("file://")
+            {
+                target.to_string()
+            } else {
+                format!("https://{}", target)
+            };
+            // ShellExecute via cmd /c start — opens in the OS default browser.
+            // Empty title arg ("") is required by `start` when the next arg is quoted.
+            silent_command("cmd")
+                .args(["/c", "start", "", &url])
+                .spawn()
+                .map_err(|e| format!("failed to open url: {}", e))?;
+            Ok(())
+        }
+        "folder" | "path" | "file" => {
+            // Works for both files and folders. explorer.exe picks the right
+            // handler; for a file path it opens the containing folder with the
+            // file selected when you pass /select, but for the common case we
+            // just open whatever it is.
+            Command::new("explorer.exe")
+                .arg(target)
+                .spawn()
+                .map_err(|e| format!("failed to open path: {}", e))?;
+            Ok(())
+        }
+        _ => Err(format!("unknown action kind: {}", kind)),
+    }
+}
+
 fn spawn_wt_with_claude(path: &str, title: &str) -> Result<(), String> {
     Command::new("wt.exe")
         .args([
@@ -2923,6 +3013,7 @@ pub fn run() {
             running_scripts: Mutex::new(HashMap::new()),
             aliases: Mutex::new(load_aliases()),
             archived: Mutex::new(load_archived()),
+            sys: Mutex::new(System::new()),
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2956,6 +3047,7 @@ pub fn run() {
             toggle_todo,
             delete_todo,
             reorder_todos,
+            open_todo_action,
             list_global_tabs,
             create_global_tab,
             rename_global_tab,
